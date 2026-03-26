@@ -176,26 +176,15 @@ def parse_backups_payload(raw: bytes) -> dict[str, Any]:
 
 
 def extract_backup_ids(payload: dict[str, Any]) -> list[str]:
-    rows = payload.get("rows", [])
-    if not isinstance(rows, list):
+    items = payload["items"]
+    if not isinstance(items, list):
         raise RuntimeError("Unexpected backups response: 'rows' is not a list")
 
-    backup_ids: list[str] = []
-    for row in rows:
-        if isinstance(row, dict):
-            for key in ("backup", "uuid", "id", "filename"):
-                value = row.get(key)
-                if isinstance(value, str) and value:
-                    backup_ids.append(value)
-                    break
+    backup_ids: list[str] = [item["id"] for item in items]
+    if len(set(backup_ids)) < len(backup_ids):
+        raise RuntimeError(f"Duplicate backup IDs")
 
-    seen: set[str] = set()
-    unique_ids: list[str] = []
-    for item in backup_ids:
-        if item not in seen:
-            seen.add(item)
-            unique_ids.append(item)
-    return unique_ids
+    return backup_ids
 
 
 def backup_filename(backup_id: str) -> str:
