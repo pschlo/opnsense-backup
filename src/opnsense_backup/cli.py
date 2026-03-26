@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import json
 import os
-import re
 import ssl
 import sys
+import time
 import tempfile
 import urllib.error
 import urllib.parse
@@ -175,22 +174,64 @@ def parse_backups_payload(raw: bytes) -> dict[str, Any]:
     return data
 
 
-def extract_backup_ids(payload: dict[str, Any]) -> list[str]:
+BackupEntry = dict[str, Any]
+
+def extract_backup_entries(payload: dict[str, Any]) -> list[BackupEntry]:
     items = payload["items"]
     if not isinstance(items, list):
-        raise RuntimeError("Unexpected backups response: 'rows' is not a list")
+        raise RuntimeError("Unexpected backups response: 'items' is not a list")
 
-    backup_ids: list[str] = [item["id"] for item in items]
-    if len(set(backup_ids)) < len(backup_ids):
-        raise RuntimeError(f"Duplicate backup IDs")
+    entries: list[BackupEntry] = []
+    seen_ids: set[str] = set()
 
-    return backup_ids
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"Unexpected backups response: item {index} is not an object")
+
+        backup_id = item.get("id")
+        if not isinstance(backup_id, str) or not backup_id:
+            raise RuntimeError(f"Unexpected backups response: item {index} missing string 'id'")
+
+        if backup_id in seen_ids:
+            raise RuntimeError("Duplicate backup IDs")
+
+        seen_ids.add(backup_id)
+        entries.append(item)
+
+    return entries
 
 
-def backup_filename(backup_id: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", backup_id).strip("_") or "unknown"
-    digest = hashlib.sha256(backup_id.encode("utf-8")).hexdigest()[:12]
-    return f"{safe}-{digest}.xml"
+def local_history_file_timestamp(path: Path) -> float:
+    """
+    Extract timestamp from filenames like:
+    config-1774471269.8738.xml
+    """
+    name = path.name
+    prefix = "config-"
+    suffix = ".xml"
+
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        raise RuntimeError(f"Unexpected history filename format: {name}")
+
+    raw = name[len(prefix):-len(suffix)]
+    return float(raw)
+
+
+def select_history_entries(
+    entries: list[BackupEntry],
+    keep_days: int | None,
+) -> list[BackupEntry]:
+    """Choose entries from the last N days."""
+    def entry_timestamp(item: BackupEntry) -> float:
+        return float(item["time"])
+
+    sorted_entries = sorted(entries, key=entry_timestamp, reverse=True)
+
+    if keep_days is None:
+        return sorted_entries
+
+    cutoff = time.time() - (keep_days * 86400)
+    return [entry for entry in sorted_entries if entry_timestamp(entry) >= cutoff]
 
 
 def download_current_config(
@@ -238,15 +279,16 @@ def download_history_configs(
     ssl_context: ssl.SSLContext | None,
     timeout: int,
     out_dir: Path,
-    backup_ids: list[str],
+    entries: list[BackupEntry],
 ) -> None:
     history_dir = safe_mkdir(out_dir / "history", out_dir)
 
     downloaded = 0
     skipped = 0
 
-    for backup_id in backup_ids:
-        target = ensure_within_dir(out_dir, history_dir / backup_filename(backup_id))
+    for entry in entries:
+        backup_id = entry["id"]
+        target = ensure_within_dir(out_dir, history_dir / backup_id)
 
         if target.exists():
             skipped += 1
@@ -267,39 +309,70 @@ def download_history_configs(
     print(f"history summary: downloaded={downloaded} skipped_existing={skipped}")
 
 
+def prune_local_history(
+    out_dir: Path,
+    keep_days: int,
+) -> None:
+    history_dir = safe_mkdir(out_dir / "history", out_dir)
+    cutoff = time.time() - (keep_days * 86400)
+
+    local_files: list[Path] = [
+        ensure_within_dir(out_dir, path)
+        for path in history_dir.iterdir()
+        if path.is_file()
+    ]
+
+    deleted = 0
+    kept = 0
+
+    for path in local_files:
+        timestamp = local_history_file_timestamp(path)
+        if timestamp >= cutoff:
+            kept += 1
+            continue
+
+        path.unlink()
+        deleted += 1
+        print(f"pruned history: {path}")
+
+    print(f"history prune summary: deleted={deleted} kept={kept}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="opnsense-backup",
         description="Download current and historical OPNsense config backups",
     )
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    sync_parser = subparsers.add_parser("sync", help="Download current config and full history")
-    sync_parser.add_argument(
+    parser.add_argument(
         "--host",
         help="OPNsense host or base URL, e.g. router.example.com or https://router.example.com "
              "(env: OPNSENSE_HOST)",
     )
-    sync_parser.add_argument(
+    parser.add_argument(
         "--api-key",
         help="OPNsense API key (env: OPNSENSE_API_KEY)",
     )
-    sync_parser.add_argument(
+    parser.add_argument(
         "--api-secret",
         help="OPNsense API secret (env: OPNSENSE_API_SECRET)",
     )
-    sync_parser.add_argument("--out-dir", required=True, help="Output directory")
-    sync_parser.add_argument(
+    parser.add_argument("--out-dir", required=True, help="Output directory")
+    parser.add_argument(
         "--insecure",
         action="store_true",
         help="Disable TLS certificate verification",
     )
-    sync_parser.add_argument(
+    parser.add_argument(
         "--timeout",
         type=int,
         default=30,
         help="HTTP timeout in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--keep-days",
+        type=int,
+        help="Keep history entries from the last N days locally",
     )
 
     return parser
@@ -321,6 +394,8 @@ def run_sync(args: argparse.Namespace) -> int:
         "api_secret",
         "OPNSENSE_API_SECRET",
     )
+    if args.keep_days is not None and args.keep_days < 0:
+        raise RuntimeError("--keep-days must be >= 0")
 
     base_url = normalize_host_to_base_url(host)
     auth_header = build_auth_header(api_key, api_secret)
@@ -352,8 +427,11 @@ def run_sync(args: argparse.Namespace) -> int:
         out_dir=out_dir,
     )
 
-    backup_ids = extract_backup_ids(payload)
-    print(f"found {len(backup_ids)} historical backup entries")
+    entries = extract_backup_entries(payload)
+    print(f"found {len(entries)} historical backup entries")
+
+    selected_entries = select_history_entries(entries, args.keep_days)
+    print(f"selected {len(selected_entries)} historical backup entries for download")
 
     download_history_configs(
         base_url=base_url,
@@ -361,8 +439,14 @@ def run_sync(args: argparse.Namespace) -> int:
         ssl_context=ssl_context,
         timeout=args.timeout,
         out_dir=out_dir,
-        backup_ids=backup_ids,
+        entries=selected_entries,
     )
+
+    if args.keep_days is not None:
+        prune_local_history(
+            out_dir=out_dir,
+            keep_days=args.keep_days,
+        )
 
     return 0
 
@@ -372,9 +456,7 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        if args.command == "sync":
-            raise SystemExit(run_sync(args))
-        parser.error("unknown command")
+        raise SystemExit(run_sync(args))
     except RuntimeError as exc:
         eprint(f"error: {exc}")
         raise SystemExit(1)
