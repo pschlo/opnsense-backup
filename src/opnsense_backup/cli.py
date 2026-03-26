@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
 import ssl
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
-import hashlib
-import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -20,8 +20,45 @@ def eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
 
-def normalize_base_url(base_url: str) -> str:
-    return base_url.rstrip("/")
+def env_or_value(value: str | None, env_name: str) -> str | None:
+    if value is not None:
+        return value
+    env_value = os.environ.get(env_name)
+    if env_value is None or env_value.strip() == "":
+        return None
+    return env_value
+
+
+def require_value(value: str | None, name: str, env_name: str) -> str:
+    if value is None:
+        raise RuntimeError(f"Missing {name}. Set --{name.replace('_', '-')} or {env_name}.")
+    return value
+
+
+def normalize_host_to_base_url(host: str) -> str:
+    host = host.strip()
+    if not host:
+        raise RuntimeError("Host must not be empty")
+
+    if "://" not in host:
+        host = f"https://{host}"
+
+    parsed = urllib.parse.urlparse(host)
+    if parsed.scheme not in {"http", "https"}:
+        raise RuntimeError(f"Unsupported URL scheme for host: {parsed.scheme!r}")
+
+    if not parsed.netloc:
+        raise RuntimeError(f"Invalid host: {host!r}")
+
+    if parsed.path not in ("", "/"):
+        raise RuntimeError(
+            "Host must not include a path; pass only hostname[:port] or full base URL without path"
+        )
+
+    if parsed.params or parsed.query or parsed.fragment:
+        raise RuntimeError("Host must not include params, query, or fragment")
+
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def build_auth_header(api_key: str, api_secret: str) -> str:
@@ -103,7 +140,11 @@ def write_bytes_if_changed(path: Path, content: bytes, out_dir: Path) -> bool:
         except OSError as exc:
             raise RuntimeError(f"Failed reading existing file {target}: {exc}") from exc
 
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -246,9 +287,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     sync_parser = subparsers.add_parser("sync", help="Download current config and full history")
-    sync_parser.add_argument("--base-url", required=True, help="Base URL, e.g. https://router.example.com")
-    sync_parser.add_argument("--api-key", required=True, help="OPNsense API key")
-    sync_parser.add_argument("--api-secret", required=True, help="OPNsense API secret")
+    sync_parser.add_argument(
+        "--host",
+        help="OPNsense host or base URL, e.g. router.example.com or https://router.example.com "
+             "(env: OPNSENSE_HOST)",
+    )
+    sync_parser.add_argument(
+        "--api-key",
+        help="OPNsense API key (env: OPNSENSE_API_KEY)",
+    )
+    sync_parser.add_argument(
+        "--api-secret",
+        help="OPNsense API secret (env: OPNSENSE_API_SECRET)",
+    )
     sync_parser.add_argument("--out-dir", required=True, help="Output directory")
     sync_parser.add_argument(
         "--insecure",
@@ -266,8 +317,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_sync(args: argparse.Namespace) -> int:
-    base_url = normalize_base_url(args.base_url)
-    auth_header = build_auth_header(args.api_key, args.api_secret)
+    host = require_value(
+        env_or_value(args.host, "OPNSENSE_HOST"),
+        "host",
+        "OPNSENSE_HOST",
+    )
+    api_key = require_value(
+        env_or_value(args.api_key, "OPNSENSE_API_KEY"),
+        "api_key",
+        "OPNSENSE_API_KEY",
+    )
+    api_secret = require_value(
+        env_or_value(args.api_secret, "OPNSENSE_API_SECRET"),
+        "api_secret",
+        "OPNSENSE_API_SECRET",
+    )
+
+    base_url = normalize_host_to_base_url(host)
+    auth_header = build_auth_header(api_key, api_secret)
     ssl_context = make_ssl_context(args.insecure)
 
     out_dir = Path(args.out_dir).expanduser().resolve()
