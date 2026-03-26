@@ -1,0 +1,14 @@
+[project]
+name = "opnsense-backup"
+version = "0.1.0"
+description = "Download current and historical OPNsense config backups"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+opnsense-backup = "opnsense_backup.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
